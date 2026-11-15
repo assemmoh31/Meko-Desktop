@@ -1,0 +1,19 @@
+# Sensitive credentials & local user configs
+config/appsettings.json
+*.env
+*.key
+*.pem
+credentials.json
+
+# Build outputs
+bin/
+obj/
+*.user
+*.suo
+.vs/
+.idea/
+.vscode/
+
+# Test artifacts
+test_out.txt
+test_err.txt
