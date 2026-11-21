@@ -9,6 +9,8 @@ using Miko.Animation;
 using Miko.Brain;
 using Miko.Physics;
 using Miko.UI;
+using Miko.Security;
+using Miko.Voice;
 using Miko.Win32;
 
 namespace Miko;
@@ -17,6 +19,9 @@ internal static class Program
 {
     [DllImport("kernel32.dll")]
     private static extern bool AttachConsole(int dwProcessId);
+
+    [DllImport("kernel32.dll")]
+    private static extern bool AllocConsole();
 
     [DllImport("psapi.dll")]
     private static extern bool EmptyWorkingSet(IntPtr hProcess);
@@ -39,13 +44,27 @@ internal static class Program
     private static GeminiClient? _gemini;
     private static ToolDispatcher? _tools;
     private static AppConfig? _config;
+    private static VoiceEngine? _voiceEngine;
+    private static string? _pendingReply;
+    private static string? _lastUserPrompt;
 
     [STAThread]
     private static int Main(string[] args)
     {
         if (args.Length > 0 && (args[0] == "--test" || args[0] == "-t"))
         {
-            AttachConsole(ATTACH_PARENT_PROCESS);
+            if (!AttachConsole(ATTACH_PARENT_PROCESS))
+            {
+                AllocConsole();
+            }
+            try
+            {
+                var stdOut = new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true };
+                Console.SetOut(stdOut);
+                var stdErr = new StreamWriter(Console.OpenStandardError()) { AutoFlush = true };
+                Console.SetError(stdErr);
+            }
+            catch { }
             return RunTests();
         }
 
@@ -53,6 +72,18 @@ internal static class Program
         {
             AttachConsole(ATTACH_PARENT_PROCESS);
             return RunChatTest();
+        }
+
+        if (args.Length > 0 && args[0] == "--render-test")
+        {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+            return RunRenderTest();
+        }
+
+        if (args.Length > 0 && (args[0] == "--voice-test" || args[0] == "-v"))
+        {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+            return RunVoiceTest();
         }
 
         ApplicationConfiguration.Initialize();
@@ -77,8 +108,10 @@ internal static class Program
         // 2. Initialize Physics & Perching Engine
         _physics = new PhysicsEngine(_animator);
 
-        // 3. Initialize Forms
-        _overlayForm = new OverlayForm(_animator, _physics);
+        // 3. Initialize Forms & Voice Engine
+        _voiceEngine = new VoiceEngine(_config);
+
+        _overlayForm = new OverlayForm(_animator, _physics, _voiceEngine);
         _physics.RegisterIgnoredWindow(_overlayForm.Handle);
 
         _speechBubble = new SpeechBubbleForm();
@@ -86,6 +119,75 @@ internal static class Program
 
         _chatPrompt = new ChatPromptForm();
         _physics.RegisterIgnoredWindow(_chatPrompt.Handle);
+
+        // Connect Voice Animation Events
+        _voiceEngine.PlaybackStarted += (duration) =>
+        {
+            void StartSpeech()
+            {
+                _animator?.SetState(AnimationState.Talking);
+                if (_pendingReply != null)
+                {
+                    string reply = _pendingReply;
+                    _pendingReply = null;
+
+                    int intervalMs = 25;
+                    if (duration > 0.5 && reply.Length > 0)
+                    {
+                        intervalMs = Math.Clamp((int)((duration * 1000.0) / reply.Length), 15, 75);
+                    }
+
+                    int anchorX = _physics?.AnchorX ?? 0;
+                    int anchorY = _physics?.AnchorY ?? 0;
+                    int canvasSize = _animator?.CanvasSize ?? 320;
+                    _speechBubble?.ShowDialogue(_lastUserPrompt, reply, new Point(anchorX, anchorY), canvasSize, intervalMs);
+                }
+            }
+
+            if (_overlayForm?.IsHandleCreated == true && _overlayForm.InvokeRequired)
+            {
+                _overlayForm.BeginInvoke((Action)StartSpeech);
+            }
+            else
+            {
+                StartSpeech();
+            }
+        };
+
+        _voiceEngine.PlaybackFinished += () =>
+        {
+            void FinishSpeech()
+            {
+                if (_pendingReply != null)
+                {
+                    string reply = _pendingReply;
+                    _pendingReply = null;
+                    int anchorX = _physics?.AnchorX ?? 0;
+                    int anchorY = _physics?.AnchorY ?? 0;
+                    int canvasSize = _animator?.CanvasSize ?? 320;
+                    _speechBubble?.ShowDialogue(_lastUserPrompt, reply, new Point(anchorX, anchorY), canvasSize);
+                }
+                else
+                {
+                    _speechBubble?.CompleteTypewriter();
+                }
+
+                if (_animator?.CurrentState == AnimationState.Talking)
+                {
+                    bool isPerched = _physics?.CurrentSeat != null && !_physics.CurrentSeat.IsFloor;
+                    _animator.SetState(isPerched ? AnimationState.Perching : AnimationState.Idle);
+                }
+            }
+
+            if (_overlayForm?.IsHandleCreated == true && _overlayForm.InvokeRequired)
+            {
+                _overlayForm.BeginInvoke((Action)FinishSpeech);
+            }
+            else
+            {
+                FinishSpeech();
+            }
+        };
 
         // 4. Initialize AI Brain with Security Config
         _tools = new ToolDispatcher(_animator, _config);
@@ -173,24 +275,36 @@ internal static class Program
     {
         if (_animator == null || _gemini == null || _speechBubble == null || _physics == null) return;
 
+        _voiceEngine?.Stop();
+        _pendingReply = null;
+        _lastUserPrompt = text;
+
         var priorState = _animator.CurrentState;
         _animator.SetState(AnimationState.Thinking);
-        _speechBubble.ShowMessage("Thinking...", new Point(_physics.AnchorX, _physics.AnchorY), _animator.CanvasSize);
+        _speechBubble.ShowThinking(text, new Point(_physics.AnchorX, _physics.AnchorY), _animator.CanvasSize);
 
         string reply = await _gemini.ChatAsync(text);
-        string safeReply = Miko.Security.SecurityGuard.Sanitize(reply, _config?.GeminiApiKey);
+        string safeReply = Miko.Security.SecurityGuard.Sanitize(reply, _config?.GeminiApiKey, _config?.FishApiKey);
 
-        _animator.SetState(AnimationState.Talking);
-        _speechBubble.ShowMessage(safeReply, new Point(_physics.AnchorX, _physics.AnchorY), _animator.CanvasSize);
-
-        // Return to resting state after brief talking duration
-        _ = Task.Delay(4000).ContinueWith(_ =>
+        if (_voiceEngine != null && _config != null && _config.VoiceEnabled && !_voiceEngine.IsMuted)
         {
-            if (_animator.CurrentState == AnimationState.Talking)
+            _pendingReply = safeReply;
+            _ = _voiceEngine.SpeakAsync(safeReply);
+        }
+        else
+        {
+            _pendingReply = null;
+            _speechBubble.ShowDialogue(_lastUserPrompt, safeReply, new Point(_physics.AnchorX, _physics.AnchorY), _animator.CanvasSize);
+            _animator.SetState(AnimationState.Talking);
+            _ = Task.Delay(3500).ContinueWith(_ =>
             {
-                _animator.SetState(priorState == AnimationState.Perching ? AnimationState.Perching : AnimationState.Idle);
-            }
-        }, TaskScheduler.FromCurrentSynchronizationContext());
+                if (_animator.CurrentState == AnimationState.Talking)
+                {
+                    bool isPerched = _physics?.CurrentSeat != null && !_physics.CurrentSeat.IsFloor;
+                    _animator.SetState(isPerched ? AnimationState.Perching : AnimationState.Idle);
+                }
+            }, TaskScheduler.FromCurrentSynchronizationContext());
+        }
     }
 
     private static void SetupTrayIcon(string assetsDir)
@@ -213,6 +327,25 @@ internal static class Program
 
         var menu = new ContextMenuStrip();
         menu.Items.Add("Talk to Miko (Ctrl+Alt+T)", null, (s, e) => OpenChatPrompt());
+
+        var trayVoiceItem = new ToolStripMenuItem("Mute Voice");
+        trayVoiceItem.Click += (s, e) =>
+        {
+            if (_voiceEngine != null)
+            {
+                _voiceEngine.ToggleMute();
+                trayVoiceItem.Text = _voiceEngine.IsMuted ? "Unmute Voice" : "Mute Voice";
+            }
+        };
+        menu.Opening += (s, e) =>
+        {
+            if (_voiceEngine != null)
+            {
+                trayVoiceItem.Text = _voiceEngine.IsMuted ? "Unmute Voice" : "Mute Voice";
+            }
+        };
+        menu.Items.Add(trayVoiceItem);
+
         menu.Items.Add("Drop / Gravity Fall", null, (s, e) => _physics?.StartFalling());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Exit Miko", null, (s, e) => ExitApp());
@@ -247,6 +380,7 @@ internal static class Program
 
     private static void ExitApp()
     {
+        _voiceEngine?.Dispose();
         _trayIcon?.Dispose();
         _hotkey?.Dispose();
         _overlayForm?.Close();
@@ -441,7 +575,39 @@ internal static class Program
             return 1;
         }
 
-        Console.WriteLine("\nAll Phase 1 and Security Guardrail tests passed successfully!");
+        // Test 7: Fish Audio & Windows TTS Voice Synthesis Engine
+        Console.WriteLine("\n[7/7] Testing Fish Audio & Windows TTS Voice Engine...");
+
+        // 7a: Markdown cleaning preserves emotion brackets
+        string mdSample = "### Greeting\n**Hello user!** Here is `code` [giggle] and [laughing]! *Have fun* > note";
+        string fishCleaned = VoiceEngine.CleanMarkdownForFishAudio(mdSample);
+        bool bracketsPreserved = fishCleaned.Contains("[giggle]") && fishCleaned.Contains("[laughing]");
+        bool mdStripped = !fishCleaned.Contains("**") && !fishCleaned.Contains("`") && !fishCleaned.Contains("###");
+        Console.WriteLine($"      ✓ Fish Audio Markdown cleaning (preserves brackets): passed = {bracketsPreserved && mdStripped}");
+
+        // 7b: Emotion bracket stripping for offline Windows TTS fallback
+        string strippedTts = VoiceEngine.StripEmotionTags(fishCleaned);
+        bool bracketsRemoved = !strippedTts.Contains("[giggle]") && !strippedTts.Contains("[laughing]") && strippedTts.Contains("Hello user!");
+        Console.WriteLine($"      ✓ Windows TTS emotion tag stripping: passed = {bracketsRemoved}");
+
+        // 7c: Outbound Fish Audio host validation
+        bool fishHostAllowed = false;
+        try { SecurityGuard.ValidateOutboundEndpoint("https://api.fish.audio/v1/tts"); fishHostAllowed = true; } catch { }
+        Console.WriteLine($"      ✓ Fish Audio TLS endpoint validation: passed = {fishHostAllowed}");
+
+        // 7d: sk-fish key redaction
+        string fishLeak = "Error: Failed with key sk-fish-testkey1234567890abcdef in header";
+        string fishSanitized = SecurityGuard.Sanitize(fishLeak);
+        bool fishRedacted = !fishSanitized.Contains("sk-fish-testkey1234567890abcdef") && fishSanitized.Contains("[REDACTED_API_KEY]");
+        Console.WriteLine($"      ✓ sk-fish key redaction: passed = {fishRedacted}");
+
+        if (!bracketsPreserved || !mdStripped || !bracketsRemoved || !fishHostAllowed || !fishRedacted)
+        {
+            Console.WriteLine("FAIL: Voice engine self-test failed!");
+            return 1;
+        }
+
+        Console.WriteLine("\nAll Miko Phase 1, Security Guardrail, and Voice Engine tests passed successfully!");
         return 0;
     }
 
@@ -454,9 +620,55 @@ internal static class Program
         var tools = new ToolDispatcher(animator, config);
         var gemini = new GeminiClient(config, tools);
 
-        Console.WriteLine("Transmitting test message 'hello' to Gemini API...");
-        string reply = gemini.ChatAsync("hello").GetAwaiter().GetResult();
-        Console.WriteLine($"MIKO REPLY: {reply}");
+        Console.WriteLine("Q1: Testing tool query 'can you see what apps i have opened right now?'...");
+        string reply1 = gemini.ChatAsync("can you see what apps i have opened right now?").GetAwaiter().GetResult();
+        Console.WriteLine($"MIKO REPLY 1: {reply1}\n");
+
+        Console.WriteLine("Q2: Testing follow-up query 'can you see what tabs are open on my chrome browser'...");
+        string reply2 = gemini.ChatAsync("can you see what tabs are open on my chrome browser").GetAwaiter().GetResult();
+        Console.WriteLine($"MIKO REPLY 2: {reply2}\n");
+        return 0;
+    }
+
+    private static int RunRenderTest()
+    {
+        string rootDir = FindProjectRoot();
+        ApplicationConfiguration.Initialize();
+        using var bubble = new SpeechBubbleForm();
+        bubble.ShowDialogue(
+            userPrompt: "can you see what tabs are open on my chrome browser?",
+            mikoReply: "Nope, I can only see the title of the active window you're working in right now [giggle]! I don't have access to your browser tabs or private data.",
+            companionAnchor: new Point(400, 500));
+        bubble.CompleteTypewriter();
+
+        using var bmp = new Bitmap(bubble.Width, bubble.Height);
+        bubble.DrawToBitmap(bmp, new Rectangle(0, 0, bubble.Width, bubble.Height));
+        string outPath = Path.Combine(rootDir, "test_chatbox_render.png");
+        bmp.Save(outPath, System.Drawing.Imaging.ImageFormat.Png);
+        Console.WriteLine($"Rendered speech bubble to: {outPath} ({bubble.Width}x{bubble.Height})");
+        return 0;
+    }
+
+    private static int RunVoiceTest()
+    {
+        string rootDir = FindProjectRoot();
+        var config = AppConfig.Load(rootDir);
+        using var engine = new VoiceEngine(config);
+
+        Console.WriteLine("========================================");
+        Console.WriteLine("        MIKO VOICE DIAGNOSTIC           ");
+        Console.WriteLine("========================================");
+        Console.WriteLine($"Voice Enabled:     {config.VoiceEnabled}");
+        Console.WriteLine($"Voice Provider:    {config.VoiceProvider}");
+        Console.WriteLine($"Fish Model:        {config.FishModel}");
+        Console.WriteLine($"Fish Voice ID:     {config.FishVoiceId}");
+        Console.WriteLine($"Fish API Key:      {(string.IsNullOrWhiteSpace(config.FishApiKey) ? "EMPTY" : SecurityGuard.Sanitize(config.FishApiKey))}");
+        Console.WriteLine($"Fallback Provider: {config.FallbackVoiceProvider}");
+        Console.WriteLine("----------------------------------------");
+
+        Console.WriteLine("Speaking test phrase via VoiceEngine (Fish Audio Capri voice)...");
+        engine.SpeakAsync("Hello! [giggle] I'm Miko, your desktop companion!").GetAwaiter().GetResult();
+        Console.WriteLine("Voice test finished successfully!");
         return 0;
     }
 }

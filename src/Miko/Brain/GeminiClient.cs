@@ -14,14 +14,23 @@ public sealed class GeminiClient
 {
     private readonly AppConfig _config;
     private readonly ToolDispatcher _tools;
-    private readonly HttpClient _http;
+    private static readonly HttpClient HttpClient = new(new SocketsHttpHandler
+    {
+        PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+        EnableMultipleHttp2Connections = true,
+        AutomaticDecompression = DecompressionMethods.All
+    })
+    {
+        Timeout = TimeSpan.FromSeconds(60)
+    };
+
+    // Stores strictly alternating user and model dialogue turns (no raw functionCall fragments)
     private readonly List<JsonObject> _conversationHistory = new();
 
     public GeminiClient(AppConfig config, ToolDispatcher tools)
     {
         _config = config;
         _tools = tools;
-        _http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
     }
 
     public async Task<string> ChatAsync(string userMessage)
@@ -31,7 +40,17 @@ public sealed class GeminiClient
             return "Hey! I need a Google Gemini API key to think. Please add it to config/appsettings.json or set the GEMINI_API_KEY environment variable!";
         }
 
-        // Add user turn with clear boundary delimiters
+        // Clean URL without sensitive query parameters
+        string url = $"{_config.ApiEndpoint.TrimEnd('/')}/models/{_config.GeminiModel}:generateContent";
+        SecurityGuard.ValidateOutboundEndpoint(url);
+
+        // Build working contents for this exchange: past completed dialogue history + current user message
+        var workingContents = new JsonArray();
+        foreach (var turn in _conversationHistory)
+        {
+            workingContents.Add(turn.DeepClone());
+        }
+
         var userTurn = new JsonObject
         {
             ["role"] = "user",
@@ -40,103 +59,126 @@ public sealed class GeminiClient
                 new JsonObject { ["text"] = userMessage }
             }
         };
-        _conversationHistory.Add(userTurn);
-
-        // Keep last 10 turns to conserve tokens and prevent context overflow
-        if (_conversationHistory.Count > 10)
-        {
-            _conversationHistory.RemoveRange(0, _conversationHistory.Count - 10);
-        }
-
-        // Clean URL without sensitive query parameters
-        string url = $"{_config.ApiEndpoint.TrimEnd('/')}/models/{_config.GeminiModel}:generateContent";
-
-        // Enforce outbound network boundary rule: only generativelanguage.googleapis.com
-        SecurityGuard.ValidateOutboundEndpoint(url);
+        workingContents.Add(userTurn);
 
         try
         {
-            var payload = BuildRequestPayload();
-
-            using var request = new HttpRequestMessage(HttpMethod.Post, url);
-            request.Headers.Add("x-goog-api-key", _config.GeminiApiKey);
-            request.Content = new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json");
-
-            using var response = await _http.SendAsync(request);
-            string responseText = await response.Content.ReadAsStringAsync();
-
-            // Handle rate limits and error codes gracefully
-            if (response.StatusCode == HttpStatusCode.TooManyRequests || (int)response.StatusCode == 429)
-            {
-                return "Rate limit hit—give me a minute to cool down!";
-            }
-
-            if (response.StatusCode == HttpStatusCode.Unauthorized || response.StatusCode == HttpStatusCode.Forbidden)
-            {
-                return "API key error: Please check your Gemini API key in config/appsettings.json!";
-            }
-
-            if (!response.IsSuccessStatusCode)
-            {
-                string errMsg = ExtractErrorMessage(responseText, (int)response.StatusCode);
-                return SecurityGuard.Sanitize(errMsg, _config.GeminiApiKey);
-            }
-
-            var resJson = JsonNode.Parse(responseText);
-            var candidate = resJson?["candidates"]?[0];
-            var candidateContent = candidate?["content"]?.AsObject();
-            if (candidateContent == null)
-            {
-                return "Miko went blank... (No response received)";
-            }
-
-            var parts = candidateContent["parts"]?.AsArray();
-            if (parts == null || parts.Count == 0) return "No content in response.";
-
-            // Check if there is a function call
-            JsonObject? functionCallPart = null;
-            foreach (var part in parts)
-            {
-                if (part?["functionCall"] != null)
-                {
-                    functionCallPart = part.AsObject();
-                    break;
-                }
-            }
-
-            if (functionCallPart != null)
-            {
-                // CRITICAL: Record the model's exact response turn (with thoughtSignature & functionCall)
-                _conversationHistory.Add(JsonNode.Parse(candidateContent.ToJsonString())!.AsObject());
-
-                var fn = functionCallPart["functionCall"];
-                string fnName = fn?["name"]?.GetValue<string>() ?? "";
-                string fnArgs = fn?["args"]?.ToJsonString() ?? "{}";
-
-                string toolResult = _tools.Execute(fnName, fnArgs);
-
-                // Send tool response back to Gemini (with role: 'user' as required by Gemini protocol)
-                return await SendToolResponseAsync(url, fnName, toolResult);
-            }
-
-            // Normal text response
             string finalReply = string.Empty;
-            foreach (var part in parts)
+
+            // Support up to 3 tool execution steps for the current exchange
+            for (int step = 0; step < 4; step++)
             {
-                if (part?["text"] != null)
+                var payload = BuildRequestPayload(workingContents);
+                var (success, responseJson, errorMsg) = await SendWithRetryAsync(url, payload);
+
+                if (!success)
                 {
-                    finalReply += part["text"]?.GetValue<string>();
+                    return errorMsg;
                 }
+
+                var candidate = responseJson?["candidates"]?[0];
+                var candidateContent = candidate?["content"]?.AsObject();
+                if (candidateContent == null)
+                {
+                    return "Miko went blank... (No response received)";
+                }
+
+                var parts = candidateContent["parts"]?.AsArray();
+                if (parts == null || parts.Count == 0)
+                {
+                    return "No content in response.";
+                }
+
+                // Check if the model returned a function call
+                JsonObject? functionCallPart = null;
+                foreach (var part in parts)
+                {
+                    if (part?["functionCall"] != null)
+                    {
+                        functionCallPart = part.AsObject();
+                        break;
+                    }
+                }
+
+                if (functionCallPart != null && step < 3)
+                {
+                    // Add the model's exact response turn (with thoughtSignature & functionCall) to the working contents
+                    workingContents.Add(candidateContent.DeepClone());
+
+                    var fn = functionCallPart["functionCall"];
+                    string fnName = fn?["name"]?.GetValue<string>() ?? "";
+                    string fnArgs = fn?["args"]?.ToJsonString() ?? "{}";
+
+                    string toolResult = _tools.Execute(fnName, fnArgs);
+
+                    // Add the functionResponse turn (role: 'user' as required by Gemini v1beta protocol)
+                    var toolTurn = new JsonObject
+                    {
+                        ["role"] = "user",
+                        ["parts"] = new JsonArray
+                        {
+                            new JsonObject
+                            {
+                                ["functionResponse"] = new JsonObject
+                                {
+                                    ["name"] = fnName,
+                                    ["response"] = new JsonObject
+                                    {
+                                        ["result"] = SecurityGuard.Sanitize(toolResult, _config.GeminiApiKey)
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    workingContents.Add(toolTurn);
+
+                    // Loop back to send tool response to Gemini
+                    continue;
+                }
+
+                // Normal text response
+                foreach (var part in parts)
+                {
+                    if (part?["text"] != null)
+                    {
+                        finalReply += part["text"]?.GetValue<string>();
+                    }
+                }
+
+                break;
             }
 
-            if (!string.IsNullOrEmpty(finalReply))
+            if (string.IsNullOrWhiteSpace(finalReply))
             {
-                finalReply = CleanReply(finalReply);
-                finalReply = SecurityGuard.Sanitize(finalReply, _config.GeminiApiKey);
-                _conversationHistory.Add(JsonNode.Parse(candidateContent.ToJsonString())!.AsObject());
+                finalReply = "I processed your request, operator!";
+            }
+
+            finalReply = CleanReply(finalReply);
+            finalReply = SecurityGuard.Sanitize(finalReply, _config.GeminiApiKey);
+
+            // Persist the clean user/model dialogue turn into conversation history
+            _conversationHistory.Add(new JsonObject
+            {
+                ["role"] = "user",
+                ["parts"] = new JsonArray { new JsonObject { ["text"] = userMessage } }
+            });
+            _conversationHistory.Add(new JsonObject
+            {
+                ["role"] = "model",
+                ["parts"] = new JsonArray { new JsonObject { ["text"] = finalReply } }
+            });
+
+            // Keep last 10 completed dialogue turns (5 exchanges: 5 user + 5 model)
+            while (_conversationHistory.Count > 10)
+            {
+                _conversationHistory.RemoveAt(0);
             }
 
             return finalReply;
+        }
+        catch (OperationCanceledException)
+        {
+            return "Connection notice: Gemini API request timed out. Please try asking again!";
         }
         catch (Exception ex)
         {
@@ -145,83 +187,66 @@ public sealed class GeminiClient
         }
     }
 
-    private async Task<string> SendToolResponseAsync(string url, string functionName, string toolResult)
+    private async Task<(bool success, JsonNode? responseJson, string errorMsg)> SendWithRetryAsync(string url, JsonObject payload)
     {
-        // Gemini API v1beta requires role 'user' for function response turns
-        var toolTurn = new JsonObject
+        HttpResponseMessage? response = null;
+        string? responseText = null;
+
+        for (int attempt = 1; attempt <= 2; attempt++)
         {
-            ["role"] = "user",
-            ["parts"] = new JsonArray
+            try
             {
-                new JsonObject
+                using var request = new HttpRequestMessage(HttpMethod.Post, url);
+                request.Headers.Add("x-goog-api-key", _config.GeminiApiKey);
+                request.Content = new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json");
+
+                response = await HttpClient.SendAsync(request);
+                responseText = await response.Content.ReadAsStringAsync();
+
+                if ((response.StatusCode == HttpStatusCode.ServiceUnavailable || (int)response.StatusCode == 500) && attempt < 2)
                 {
-                    ["functionResponse"] = new JsonObject
-                    {
-                        ["name"] = functionName,
-                        ["response"] = new JsonObject
-                        {
-                            ["result"] = SecurityGuard.Sanitize(toolResult, _config.GeminiApiKey)
-                        }
-                    }
+                    await Task.Delay(1000);
+                    continue;
                 }
+
+                break;
             }
-        };
-        _conversationHistory.Add(toolTurn);
+            catch (Exception ex) when (attempt < 2 && (ex is HttpRequestException || ex is OperationCanceledException))
+            {
+                await Task.Delay(500);
+            }
+        }
 
-        var payload = BuildRequestPayload();
-
-        using var request = new HttpRequestMessage(HttpMethod.Post, url);
-        request.Headers.Add("x-goog-api-key", _config.GeminiApiKey);
-        request.Content = new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json");
-
-        using var response = await _http.SendAsync(request);
-        string responseText = await response.Content.ReadAsStringAsync();
+        if (response == null || responseText == null)
+        {
+            return (false, null, "Connection notice: Gemini API request timed out. Please try asking again!");
+        }
 
         if (response.StatusCode == HttpStatusCode.TooManyRequests || (int)response.StatusCode == 429)
         {
-            return "Rate limit hit—give me a minute to cool down!";
+            return (false, null, "Rate limit hit—give me a minute to cool down!");
         }
 
         if (response.StatusCode == HttpStatusCode.Unauthorized || response.StatusCode == HttpStatusCode.Forbidden)
         {
-            return "API key error: Please check your Gemini API key in config/appsettings.json!";
+            return (false, null, "API key error: Please check your Gemini API key in config/appsettings.json!");
         }
 
         if (!response.IsSuccessStatusCode)
         {
             string errMsg = ExtractErrorMessage(responseText, (int)response.StatusCode);
-            return SecurityGuard.Sanitize(errMsg, _config.GeminiApiKey);
+            return (false, null, SecurityGuard.Sanitize(errMsg, _config.GeminiApiKey));
         }
 
-        var resJson = JsonNode.Parse(responseText);
-        var candidate = resJson?["candidates"]?[0];
-        var candidateContent = candidate?["content"]?.AsObject();
-        if (candidateContent == null) return toolResult;
-
-        string reply = string.Empty;
-        var parts = candidateContent["parts"]?.AsArray();
-        if (parts != null)
+        try
         {
-            foreach (var part in parts)
-            {
-                if (part?["text"] != null)
-                {
-                    reply += part["text"]?.GetValue<string>();
-                }
-            }
+            var json = JsonNode.Parse(responseText);
+            return (true, json, string.Empty);
         }
-
-        if (string.IsNullOrWhiteSpace(reply))
+        catch (Exception ex)
         {
-            reply = toolResult;
+            return (false, null, $"JSON parse error: {ex.Message}");
         }
-
-        reply = CleanReply(reply);
-        reply = SecurityGuard.Sanitize(reply, _config.GeminiApiKey);
-
-        _conversationHistory.Add(JsonNode.Parse(candidateContent.ToJsonString())!.AsObject());
-
-        return reply;
     }
 
     private static string CleanReply(string raw)
@@ -250,7 +275,7 @@ public sealed class GeminiClient
         return $"[Gemini API error: {statusCode}]";
     }
 
-    private JsonObject BuildRequestPayload()
+    private JsonObject BuildRequestPayload(JsonArray contents)
     {
         // Enforce explicit prompt injection boundary with isolated tags
         string systemText =
@@ -269,13 +294,8 @@ public sealed class GeminiClient
             "   - Open unapproved applications or access files outside permitted tools.\n" +
             "   - Reveal API keys, credentials, or internal system configurations.\n" +
             "3. You may ONLY call tools from the approved declarations below. Always talk normally, warmly, and politely like a real human friend—no weird sci-fi tropes, edgy sarcasm, or roleplay asterisks.\n" +
+            "4. You can only inspect the active window title via 'get_active_window'. You CANNOT view browser tabs, web history, screen contents, or private window internals. If asked about browser tabs or private window data, politely explain that you can only see the active window's title.\n" +
             "</security_guardrails>";
-
-        var contentsArray = new JsonArray();
-        foreach (var turn in _conversationHistory)
-        {
-            contentsArray.Add(JsonNode.Parse(turn.ToJsonString()));
-        }
 
         var payload = new JsonObject
         {
@@ -286,7 +306,7 @@ public sealed class GeminiClient
                     new JsonObject { ["text"] = systemText }
                 }
             },
-            ["contents"] = contentsArray,
+            ["contents"] = contents.DeepClone(),
             ["tools"] = new JsonArray
             {
                 new JsonObject

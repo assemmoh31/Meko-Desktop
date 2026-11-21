@@ -15,10 +15,16 @@ public static class CyberpunkTheme
     public static readonly Color TextPrimary = Color.FromArgb(245, 248, 252);
     public static readonly Color TextSecondary = Color.FromArgb(144, 160, 180);
     public static readonly Color Border = Color.FromArgb(40, 60, 85);
+    public static readonly Color PromptColor = Color.FromArgb(165, 205, 235);
+    public static readonly Color DimDivider = Color.FromArgb(35, 55, 80);
+    public static readonly Color StatusAmber = Color.FromArgb(255, 175, 20);
+    public static readonly Color StatusGreen = Color.FromArgb(0, 240, 160);
 
     private static readonly PrivateFontCollection FontCollection = new();
     public static Font MonoFont { get; private set; }
     public static Font TitleFont { get; private set; }
+    public static Font HeaderFont { get; private set; }
+    public static Font PromptFont { get; private set; }
 
     static CyberpunkTheme()
     {
@@ -35,8 +41,10 @@ public static class CyberpunkTheme
             {
                 FontCollection.AddFontFile(fontPath);
                 var fontFamily = FontCollection.Families[0];
-                MonoFont = new Font(fontFamily, 10.5f, FontStyle.Regular);
-                TitleFont = new Font(fontFamily, 11.5f, FontStyle.Bold);
+                MonoFont = new Font(fontFamily, 10f, FontStyle.Regular);
+                TitleFont = new Font(fontFamily, 11f, FontStyle.Bold);
+                HeaderFont = new Font(fontFamily, 8f, FontStyle.Bold);
+                PromptFont = new Font(fontFamily, 9.5f, FontStyle.Regular);
                 return;
             }
             catch
@@ -47,5 +55,7 @@ public static class CyberpunkTheme
 
         MonoFont = new Font("Consolas", 10f, FontStyle.Regular);
         TitleFont = new Font("Consolas", 11f, FontStyle.Bold);
+        HeaderFont = new Font("Consolas", 8f, FontStyle.Bold);
+        PromptFont = new Font("Consolas", 9.5f, FontStyle.Regular);
     }
 }

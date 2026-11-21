@@ -8,7 +8,11 @@ namespace Miko.Security;
 
 public static class SecurityGuard
 {
-    private const string AllowedApiHost = "generativelanguage.googleapis.com";
+    private static readonly HashSet<string> AllowedApiHosts = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "generativelanguage.googleapis.com",
+        "api.fish.audio"
+    };
 
     // Hard-coded default allowlist of safe applications
     private static readonly Dictionary<string, (string Exe, string Name)> DefaultAllowlist =
@@ -55,10 +59,12 @@ public static class SecurityGuard
     });
 
     private static readonly Regex ApiKeyRegex = new(@"AIza[0-9A-Za-z-_]{35}", RegexOptions.Compiled);
+    private static readonly Regex FishApiKeyRegex = new(@"sk-fish-[0-9A-Za-z-_]+", RegexOptions.Compiled);
     private static readonly Regex QueryKeyRegex = new(@"(key=)[A-Za-z0-9_\-]+", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex BearerKeyRegex = new(@"(Bearer\s+)[A-Za-z0-9_\-]+", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     /// <summary>
-    /// Validates that outbound network requests are strictly limited to the official Google Gemini API host.
+    /// Validates that outbound network requests are strictly limited to official Google Gemini and Fish Audio hosts.
     /// </summary>
     public static void ValidateOutboundEndpoint(string url)
     {
@@ -72,9 +78,9 @@ public static class SecurityGuard
             throw new InvalidOperationException("Insecure HTTP scheme rejected. Outbound connections must use TLS (HTTPS).");
         }
 
-        if (!string.Equals(uri.Host, AllowedApiHost, StringComparison.OrdinalIgnoreCase))
+        if (!AllowedApiHosts.Contains(uri.Host))
         {
-            throw new InvalidOperationException($"Unauthorized outbound host '{uri.Host}'. Only '{AllowedApiHost}' is permitted.");
+            throw new InvalidOperationException($"Unauthorized outbound host '{uri.Host}'. Only official Gemini and Fish Audio hosts are permitted.");
         }
     }
 
@@ -211,19 +217,27 @@ public static class SecurityGuard
     /// <summary>
     /// Redacts API keys and sensitive tokens from strings before they are logged or shown on screen.
     /// </summary>
-    public static string Sanitize(string? text, string? sensitiveKey)
+    public static string Sanitize(string? text, params string?[] sensitiveKeys)
     {
         if (string.IsNullOrEmpty(text)) return string.Empty;
 
         string sanitized = text;
 
-        if (!string.IsNullOrWhiteSpace(sensitiveKey))
+        if (sensitiveKeys != null)
         {
-            sanitized = sanitized.Replace(sensitiveKey, "[REDACTED_API_KEY]");
+            foreach (var key in sensitiveKeys)
+            {
+                if (!string.IsNullOrWhiteSpace(key))
+                {
+                    sanitized = sanitized.Replace(key, "[REDACTED_API_KEY]");
+                }
+            }
         }
 
         sanitized = ApiKeyRegex.Replace(sanitized, "[REDACTED_API_KEY]");
+        sanitized = FishApiKeyRegex.Replace(sanitized, "[REDACTED_API_KEY]");
         sanitized = QueryKeyRegex.Replace(sanitized, "$1[REDACTED_API_KEY]");
+        sanitized = BearerKeyRegex.Replace(sanitized, "$1[REDACTED_API_KEY]");
 
         return sanitized;
     }

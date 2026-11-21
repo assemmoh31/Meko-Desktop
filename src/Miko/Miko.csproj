@@ -5,6 +5,7 @@
     <TargetFramework>net8.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>Miko</RootNamespace>
     <AssemblyName>Miko</AssemblyName>
@@ -15,5 +16,9 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <ApplicationIcon>..\..\assets\chip.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Speech" Version="8.0.0" />
+  </ItemGroup>
 
 </Project>

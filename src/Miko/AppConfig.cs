@@ -16,6 +16,12 @@ public sealed class AppConfig
     public string UserContext { get; set; } = string.Empty;
     public Dictionary<string, string> AllowedApps { get; } = new(StringComparer.OrdinalIgnoreCase);
     public bool RequireConfirmation { get; set; } = true;
+    public bool VoiceEnabled { get; set; } = true;
+    public string VoiceProvider { get; set; } = "fishaudio";
+    public string FishApiKey { get; set; } = string.Empty;
+    public string FishModel { get; set; } = "s2.1-pro-free";
+    public string FishVoiceId { get; set; } = "fdef76c9b2e741119d817754bd8b5dd0";
+    public string FallbackVoiceProvider { get; set; } = "windows";
 
     public static AppConfig Load(string rootDir)
     {
@@ -38,6 +44,15 @@ public sealed class AppConfig
                 {
                     if (comp.TryGetProperty("Size", out var size)) config.CompanionSize = size.GetDouble();
                 }
+                if (root.TryGetProperty("Voice", out var voice))
+                {
+                    if (voice.TryGetProperty("Enabled", out var ve)) config.VoiceEnabled = ve.GetBoolean();
+                    if (voice.TryGetProperty("Provider", out var vp)) config.VoiceProvider = vp.GetString() ?? "fishaudio";
+                    if (voice.TryGetProperty("FishApiKey", out var fk)) config.FishApiKey = fk.GetString() ?? "";
+                    if (voice.TryGetProperty("FishModel", out var fm)) config.FishModel = fm.GetString() ?? "s2.1-pro-free";
+                    if (voice.TryGetProperty("FishVoiceId", out var fv)) config.FishVoiceId = fv.GetString() ?? "fdef76c9b2e741119d817754bd8b5dd0";
+                    if (voice.TryGetProperty("FallbackProvider", out var fb)) config.FallbackVoiceProvider = fb.GetString() ?? "windows";
+                }
                 if (root.TryGetProperty("Security", out var sec))
                 {
                     if (sec.TryGetProperty("RequireConfirmation", out var rc)) config.RequireConfirmation = rc.GetBoolean();
@@ -58,6 +73,12 @@ public sealed class AppConfig
         if (!string.IsNullOrWhiteSpace(envKey))
         {
             config.GeminiApiKey = envKey.Trim();
+        }
+
+        string? envFishKey = Environment.GetEnvironmentVariable("FISH_API_KEY");
+        if (!string.IsNullOrWhiteSpace(envFishKey))
+        {
+            config.FishApiKey = envFishKey.Trim();
         }
 
         // Validate outbound endpoint strictly

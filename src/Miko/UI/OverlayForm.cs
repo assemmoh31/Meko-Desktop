@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using Miko.Animation;
 using Miko.Physics;
+using Miko.Voice;
 using Miko.Win32;
 
 namespace Miko.UI;
@@ -12,6 +13,7 @@ public sealed class OverlayForm : Form
 {
     private readonly SpriteAnimator _animator;
     private readonly PhysicsEngine _physics;
+    private readonly VoiceEngine? _voiceEngine;
     private readonly System.Windows.Forms.Timer _tickTimer;
 
     private IntPtr _memoryDc = IntPtr.Zero;
@@ -23,10 +25,11 @@ public sealed class OverlayForm : Form
     public event Action? RequestChatPrompt;
     public event Action? RequestExit;
 
-    public OverlayForm(SpriteAnimator animator, PhysicsEngine physics)
+    public OverlayForm(SpriteAnimator animator, PhysicsEngine physics, VoiceEngine? voiceEngine = null)
     {
         _animator = animator;
         _physics = physics;
+        _voiceEngine = voiceEngine;
 
         FormBorderStyle = FormBorderStyle.None;
         ShowInTaskbar = false;
@@ -90,6 +93,24 @@ public sealed class OverlayForm : Form
         var talkItem = new ToolStripMenuItem("Talk to Miko... (Ctrl+Alt+T)");
         talkItem.Click += (s, e) => RequestChatPrompt?.Invoke();
         menu.Items.Add(talkItem);
+
+        var muteVoiceItem = new ToolStripMenuItem("Mute Voice");
+        muteVoiceItem.Click += (s, e) =>
+        {
+            if (_voiceEngine != null)
+            {
+                _voiceEngine.ToggleMute();
+                muteVoiceItem.Text = _voiceEngine.IsMuted ? "Unmute Voice" : "Mute Voice";
+            }
+        };
+        menu.Opening += (s, e) =>
+        {
+            if (_voiceEngine != null)
+            {
+                muteVoiceItem.Text = _voiceEngine.IsMuted ? "Unmute Voice" : "Mute Voice";
+            }
+        };
+        menu.Items.Add(muteVoiceItem);
 
         menu.Items.Add(new ToolStripSeparator());
 
